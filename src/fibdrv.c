@@ -6,8 +6,9 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
-#include <linux/version.h>
-
+#include <linux/slab.h>
+#include <linux/uaccess.h>
+#include "bigNum.h"
 MODULE_LICENSE("Dual MIT/GPL");
 MODULE_AUTHOR("National Cheng Kung University, Taiwan");
 MODULE_DESCRIPTION("Fibonacci engine driver");
@@ -18,26 +19,94 @@ MODULE_VERSION("0.1");
 /* MAX_LENGTH is set to 92 because
  * ssize_t can't fit the number > 92
  */
-#define MAX_LENGTH 92
+#define MAX_LENGTH 100
 
 static dev_t fib_dev = 0;
 static struct class *fib_class;
 static DEFINE_MUTEX(fib_mutex);
 static int major = 0, minor = 0;
 
+static long long fib_helper(long long n, long long *f)
+{
+    if (n <= 2)
+        return n ? (f[n] = 1) : (f[n] = 0);
+    else if (f[n] != 0)
+        return f[n];
+
+    long long a = fib_helper(n >> 1, f);
+    long long b = fib_helper((n >> 1) + 1, f);
+
+    return f[n] = (n & 1) ? a * a + b * b : (a * ((b << 1) - a));
+
+}
+
+static long long fib_sequence_rec(long long k)
+{
+    long long *f = kmalloc((k + 2) * sizeof(long long), GFP_KERNEL);
+    memset(f, 0, (k + 2) * sizeof(long long));
+    fib_helper(k, f);
+    return f[k];
+}
 static long long fib_sequence(long long k)
 {
-    /* FIXME: C99 variable-length array (VLA) is not allowed in Linux kernel. */
-    long long f[k + 2];
+    if (k <= 2)
+        return !!k;
+    long long a = 1; 
+    long long b = 1;
+    uint8_t count = 63 - __builtin_clzll(k);
+    for (uint64_t i = count; i-- > 0;) {
+        long long c = a * ((b << 1) - a);
+        long long d = a * a + b * b;
+        if (k & (1UL << i)) {
+            a = d;
+            b = c + d;
+        }
+        else {
+            a = c;
+            b = d;
+        }
+    }
+    return a;
+}
 
-    f[0] = 0;
-    f[1] = 1;
-
-    for (int i = 2; i <= k; i++) {
-        f[i] = f[i - 1] + f[i - 2];
+static void fib_fdoubling_bn(bn *dest, unsigned int n)
+{
+    bn_resize(dest, 1);
+    if (n < 2) { //Fib(0) = 0, Fib(1) = 1
+        dest->number[0] = n;
+        return;
     }
 
-    return f[k];
+    bn *f1 = dest; /* F(k) */
+    bn *f2 = bn_alloc(1); /* F(k+1) */
+    f1->number[0] = 0;
+    f2->number[0] = 1;
+    bn *k1 = bn_alloc(1);
+    bn *k2 = bn_alloc(1);
+
+    for (unsigned int i = 1U << 31; i; i >>= 1) {
+        /* F(2k) = F(k) * [ 2 * F(k+1) – F(k) ] */
+        bn_cpy(k1, f2);
+        bn_lshift(k1, 1);
+        bn_sub(k1, f1, k1);
+        bn_mult(k1, f1, k1);
+        /* F(2k+1) = F(k)^2 + F(k+1)^2 */
+        bn_mult(f1, f1, f1);
+        bn_mult(f2, f2, f2);
+        bn_cpy(k2, f1);
+        bn_add(k2, f2, k2);
+        if (n & i) {
+            bn_cpy(f1, k2);
+            bn_cpy(f2, k1);
+            bn_add(f2, k2, f2);
+        } else {
+            bn_cpy(f1, k1);
+            bn_cpy(f2, k2);
+        }
+    }
+    bn_free(f2);
+    bn_free(k1);
+    bn_free(k2);
 }
 
 static int fib_open(struct inode *inode, struct file *file)
@@ -55,13 +124,29 @@ static int fib_release(struct inode *inode, struct file *file)
     return 0;
 }
 
+static bn *fib_time_proxy(long long k)
+{
+    // kt = ktime_get();
+    bn *dest = bn_alloc(1);
+    fib_fdoubling_bn(dest, k);
+    // kt = ktime_sub(ktime_get(), kt);
+    return dest;
+}
+
 /* calculate the fibonacci number at given offset */
 static ssize_t fib_read(struct file *file,
                         char *buf,
                         size_t size,
                         loff_t *offset)
 {
-    return (ssize_t) fib_sequence(*offset);
+    // return (ssize_t) fib_sequence_rec(*offset);
+    // return (ssize_t) fib_sequence(*offset);
+    bn *dest = fib_time_proxy(*offset);
+    // fib_fdoubling_bn(dest, *offset);
+    int len = dest->size;
+    copy_to_user(buf, (char *)dest->number, 4 * len);
+    return (ssize_t)len;
+
 }
 
 /* write operation is skipped */
@@ -119,11 +204,9 @@ static int __init init_fib_dev(void)
         goto failed_cdev;
     }
     fib_dev = MKDEV(major, minor);
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
-    fib_class = class_create(DEV_FIBONACCI_NAME);
-#else
+
     fib_class = class_create(THIS_MODULE, DEV_FIBONACCI_NAME);
-#endif
+
     if (!fib_class) {
         printk(KERN_ALERT "Failed to create device class\n");
         rc = -3;
